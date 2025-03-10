@@ -89,7 +89,6 @@ class TrackersUDPServer(private val port: Int, name: String, private val tracker
 				protocolVersion = handshake.protocolVersion
 				firmwareVersion = handshake.firmware
 				connectionsByAddress[address] = this
-
 				val i = connections.indexOf(this)
 				LogManager
 					.info(
@@ -102,6 +101,12 @@ class TrackersUDPServer(private val port: Int, name: String, private val tracker
 						name: $name
 						""".trimIndent(),
 					)
+				this.lastPingPacketTime = 0
+				this.firmwareFeatures = FirmwareFeatures()
+				bb.limit(bb.capacity())
+				bb.rewind()
+				parser.writeHandshakeResponse(bb, this)
+				socket.send(DatagramPacket(rcvBuffer, bb.position(), socketAddr))
 			} ?: connectionsByAddress[socketAddr]?.apply {
 				// Look for an existing connection by the socket address (IP and port)
 				// and update the connection information
@@ -124,6 +129,12 @@ class TrackersUDPServer(private val port: Int, name: String, private val tracker
 						name: $name
 						""".trimIndent(),
 					)
+				this.lastPingPacketTime = 0
+				this.firmwareFeatures = FirmwareFeatures()
+				bb.limit(bb.capacity())
+				bb.rewind()
+				parser.writeHandshakeResponse(bb, this)
+				socket.send(DatagramPacket(rcvBuffer, bb.position(), socketAddr))
 			}
 		} ?: run {
 			// No existing connection could be found, create a new one
