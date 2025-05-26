@@ -14,8 +14,8 @@ export function AppLayout() {
 
     if (config.fonts !== undefined) {
       document.documentElement.style.setProperty(
-        '--font-name',
-        config.fonts.map((x) => `"${x}"`).join(',')
+        '--font-name', 'Courier New'
+//        config.fonts.map((x) => `"${x}"`).join(',')
       );
     }
 
