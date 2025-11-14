@@ -75,109 +75,27 @@ class TrackersUDPServer(private val port: Int, name: String, private val tracker
 		}
 
 		// Get a connection either by an existing one, or by creating a new one
+		// Refactored: split logic into small helper functions while keeping the
+		// synchronized(connections) semantics intact.
 		val connection: UDPDevice = synchronized(connections) {
+			// Try to find by MAC first
 			connectionsByMAC[handshake.macString]?.apply {
-				// Look for an existing connection by the MAC address and update the
-				// connection information
-				connectionsByAddress.remove(address)
-				address = socketAddr
-				lastPacketNumber = 0
-				ipAddress = addr
-				name = handshake.macString?.let { "udp://$it" }
-				descriptiveName = "udp:/$addr"
-				protocolVersion = handshake.protocolVersion
-				firmwareVersion = handshake.firmware
-				connectionsByAddress[address] = this
-
-				val i = connections.indexOf(this)
-				LogManager
-					.info(
-						"""
-						[TrackerServer] Tracker $i handed over to address $socketAddr.
-						Board type: ${handshake.boardType},
-						firmware name: ${handshake.firmware},
-						protocol version: $protocolVersion,
-						mac: ${handshake.macString},
-						name: $name
-						""".trimIndent(),
-					)
+				updateExistingConnectionFromMAC(this, socketAddr, addr, handshake)
 			} ?: connectionsByAddress[socketAddr]?.apply {
-				// Look for an existing connection by the socket address (IP and port)
-				// and update the connection information
-				lastPacketNumber = 0
-				ipAddress = addr
-				name = handshake.macString?.let { "udp://$it" }
-					?: "udp:/$addr"
-				descriptiveName = "udp:/$addr"
-				protocolVersion = handshake.protocolVersion
-				firmwareVersion = handshake.firmware
-				val i = connections.indexOf(this)
-				LogManager
-					.info(
-						"""
-						[TrackerServer] Tracker $i reconnected from address $socketAddr.
-						Board type: ${handshake.boardType},
-						firmware name: ${handshake.firmware},
-						protocol version: $protocolVersion,
-						mac: ${handshake.macString},
-						name: $name
-						""".trimIndent(),
-					)
+				updateExistingConnectionFromAddress(this, socketAddr, addr, handshake)
 			}
 		} ?: run {
 			// No existing connection could be found, create a new one
-
-			val connection = UDPDevice(
-				socketAddr,
-				addr,
-				handshake.macString ?: addr.hostAddress,
-				handshake.boardType,
-				handshake.mcuType,
-			)
-			VRServer.instance.deviceManager.addDevice(connection)
-			connection.protocolVersion = handshake.protocolVersion
-			connection.protocol = if (handshake.firmware?.isEmpty() == true) {
-				// Only old owoTrack doesn't report firmware and have different packet IDs with SlimeVR
-				NetworkProtocol.OWO_LEGACY
-			} else {
-				NetworkProtocol.SLIMEVR_RAW
-			}
-			connection.name = handshake.macString?.let { "udp://$it" }
-				?: "udp:/$addr"
-			// TODO: The missing slash in udp:// was intended because InetAddress.toString()
-			// 		returns "hostname/address" but it wasn't known that if hostname is empty
-			// 		string it just looks like "/address" lol.
-			// 		Fixing this would break config!
-			connection.descriptiveName = "udp:/$addr"
-			connection.firmwareVersion = handshake.firmware
-			synchronized(connections) {
-				// Register the new connection
-				val i = connections.size
-				connections.add(connection)
-				connectionsByAddress[socketAddr] = connection
-				if (handshake.macString != null) {
-					connectionsByMAC[handshake.macString!!] = connection
-				}
-				LogManager
-					.info(
-						"""
-						[TrackerServer] Tracker $i connected from address $socketAddr.
-						Board type: ${handshake.boardType},
-						firmware name: ${handshake.firmware},
-						protocol version: ${connection.protocolVersion},
-						mac: ${handshake.macString},
-						name: ${connection.name}
-						""".trimIndent(),
-					)
-			}
-			if (connection.protocol == NetworkProtocol.OWO_LEGACY || connection.protocolVersion < 9) {
+			val newConnection = createNewConnection(socketAddr, addr, handshake)
+			if (newConnection.protocol == NetworkProtocol.OWO_LEGACY || newConnection.protocolVersion < 9) {
 				// Set up new sensor for older firmware.
 				// Firmware after 7 should send sensor status packet and sensor
 				// will be created when it's received
-				setUpSensor(connection, 0, handshake.imuType, 1, MagnetometerStatus.NOT_SUPPORTED, null, TrackerDataType.ROTATION)
+				setUpSensor(newConnection, 0, handshake.imuType, 1, MagnetometerStatus.NOT_SUPPORTED, null, TrackerDataType.ROTATION)
 			}
-			connection
+			newConnection
 		}
+
 		connection.firmwareFeatures = FirmwareFeatures()
 		bb.limit(bb.capacity())
 		bb.rewind()
@@ -185,6 +103,126 @@ class TrackersUDPServer(private val port: Int, name: String, private val tracker
 		socket.send(DatagramPacket(rcvBuffer, bb.position(), connection.address))
 	}
 
+	/**
+	 * Update an existing connection found by MAC address. Must be called inside
+	 * synchronized(connections) to preserve thread-safety when mutating maps.
+	 */
+	private fun updateExistingConnectionFromMAC(connection: UDPDevice, socketAddr: SocketAddress, addr: java.net.InetAddress, handshake: UDPPacket3Handshake) {
+		// Look for an existing connection by the MAC address and update the
+		// connection information
+		connectionsByAddress.remove(connection.address)
+		connection.address = socketAddr
+		connection.lastPacketNumber = 0
+		connection.ipAddress = addr
+		connection.name = handshake.macString?.let { "udp://$it" }
+		connection.descriptiveName = "udp:/$addr"
+		connection.protocolVersion = handshake.protocolVersion
+		connection.firmwareVersion = handshake.firmware
+		connectionsByAddress[connection.address] = connection
+
+		val i = connections.indexOf(connection)
+		LogManager
+			.info(
+				"""
+				[TrackerServer] Tracker $i handed over to address $socketAddr.
+				Board type: ${handshake.boardType},
+				firmware name: ${handshake.firmware},
+				protocol version: ${handshake.protocolVersion},
+				mac: ${handshake.macString},
+				name: $name
+				""".trimIndent(),
+			)
+		// Todo: Send Hey OVR =D 5 Packet to notify reconnection
+		bb.limit(bb.capacity())
+		bb.rewind()
+		parser.writeHandshakeResponse(bb, connection)
+		socket.send(DatagramPacket(rcvBuffer, bb.position(), connection.address))
+	}
+
+	/**
+	 * Update an existing connection found by socket address. Must be called inside
+	 * synchronized(connections) to preserve thread-safety when mutating maps.
+	 */
+	private fun updateExistingConnectionFromAddress(connection: UDPDevice, socketAddr: SocketAddress, addr: java.net.InetAddress, handshake: UDPPacket3Handshake) {
+		// Look for an existing connection by the socket address (IP and port)
+		// and update the connection information
+		connection.lastPacketNumber = 0
+		connection.ipAddress = addr
+		connection.name = handshake.macString?.let { "udp://$it" }
+			?: "udp:/$addr"
+		connection.descriptiveName = "udp:/$addr"
+		connection.protocolVersion = handshake.protocolVersion
+		connection.firmwareVersion = handshake.firmware
+		val i = connections.indexOf(connection)
+		LogManager
+			.info(
+				"""
+				[TrackerServer] Tracker $i reconnected from address $socketAddr.
+				Board type: ${handshake.boardType},
+				firmware name: ${handshake.firmware},
+				protocol version: ${handshake.protocolVersion},
+				mac: ${handshake.macString},
+				name: $name
+				""".trimIndent(),
+			)
+		// Todo: Send Hey OVR =D 5 Packet to notify reconnection
+		bb.limit(bb.capacity())
+		bb.rewind()
+		parser.writeHandshakeResponse(bb, connection)
+		socket.send(DatagramPacket(rcvBuffer, bb.position(), connection.address))
+	}
+
+	/**
+	 * Create and register a new UDPDevice. Registration into the shared
+	 * collections (connections, connectionsByAddress, connectionsByMAC) is
+	 * performed inside synchronized(connections).
+	 */
+	private fun createNewConnection(socketAddr: SocketAddress, addr: java.net.InetAddress, handshake: UDPPacket3Handshake): UDPDevice {
+		val connection = UDPDevice(
+			socketAddr,
+			addr,
+			handshake.macString ?: addr.hostAddress,
+			handshake.boardType,
+			handshake.mcuType,
+		)
+		VRServer.instance.deviceManager.addDevice(connection)
+		connection.protocolVersion = handshake.protocolVersion
+		connection.protocol = if (handshake.firmware?.isEmpty() == true) {
+			// Only old owoTrack doesn't report firmware and have different packet IDs with SlimeVR
+			NetworkProtocol.OWO_LEGACY
+		} else {
+			NetworkProtocol.SLIMEVR_RAW
+		}
+		connection.name = handshake.macString?.let { "udp://$it" }
+			?: "udp:/$addr"
+		// TODO: The missing slash in udp:// was intended because InetAddress.toString()
+		// 		returns "hostname/address" but it wasn't known that if hostname is empty
+		// 		string it just looks like "/address" lol.
+		// 		Fixing this would break config!
+		connection.descriptiveName = "udp:/$addr"
+		connection.firmwareVersion = handshake.firmware
+		// Register the new connection inside synchronized block
+		synchronized(connections) {
+			val i = connections.size
+			connections.add(connection)
+			connectionsByAddress[socketAddr] = connection
+			if (handshake.macString != null) {
+				connectionsByMAC[handshake.macString!!] = connection
+			}
+			LogManager
+				.info(
+					"""
+					[TrackerServer] Tracker $i connected from address $socketAddr.
+					Board type: ${handshake.boardType},
+					firmware name: ${handshake.firmware},
+					protocol version: ${connection.protocolVersion},
+					mac: ${handshake.macString},
+					name: ${connection.name}
+					""".trimIndent(),
+			)
+		}
+		return connection
+	}
 	private val mainScope = CoroutineScope(SupervisorJob())
 	private fun setUpSensor(connection: UDPDevice, trackerId: Int, sensorType: IMUType, sensorStatus: Int, magStatus: MagnetometerStatus, trackerPosition: TrackerPosition?, trackerDataType: TrackerDataType) {
 		LogManager.info("[TrackerServer] Sensor $trackerId for ${connection.name} status: $sensorStatus")
